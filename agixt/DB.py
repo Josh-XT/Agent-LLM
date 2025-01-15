@@ -10,12 +10,18 @@ from sqlalchemy import (
     ForeignKey,
     DateTime,
     Boolean,
+    event,
+    DDL,
     func,
+    text,
 )
 from sqlalchemy.orm import sessionmaker, relationship, declarative_base
 from sqlalchemy.dialects.postgresql import UUID
+from sqlalchemy.types import TypeDecorator, VARCHAR
+from sqlalchemy.sql.sqltypes import ARRAY, Float
 from cryptography.fernet import Fernet
 from Globals import getenv
+import numpy as np
 
 logging.basicConfig(
     level=getenv("LOG_LEVEL"),
@@ -714,6 +720,112 @@ class Prompt(Base):
     arguments = relationship("Argument", backref="prompt", cascade="all, delete-orphan")
 
 
+if DATABASE_TYPE == "sqlite":
+
+    class Vector(TypeDecorator):
+        impl = VARCHAR
+        cache_ok = True
+
+        def load_dialect_impl(self, dialect):
+            return dialect.type_descriptor(VARCHAR)
+
+        def process_bind_param(self, value, dialect):
+            # SQLite needs string representation
+            if value is not None:
+                if isinstance(value, np.ndarray):
+                    return f'[{",".join(map(str, value.flatten()))}]'
+                elif isinstance(value, list):
+                    return f'[{",".join(map(str, value))}]'
+            return value
+
+        def process_result_value(self, value, dialect):
+            if value is not None:
+                return np.array(eval(value))
+            return None
+
+else:
+    from pgvector.sqlalchemy import Vector
+
+
+class Memory(Base):
+    __tablename__ = "memory"
+    id = Column(
+        UUID(as_uuid=True) if DATABASE_TYPE != "sqlite" else String,
+        primary_key=True,
+        default=get_new_id if DATABASE_TYPE == "sqlite" else uuid.uuid4,
+    )
+    agent_id = Column(
+        UUID(as_uuid=True) if DATABASE_TYPE != "sqlite" else String,
+        ForeignKey("agent.id"),
+        nullable=False,
+    )
+    conversation_id = Column(
+        UUID(as_uuid=True) if DATABASE_TYPE != "sqlite" else String,
+        ForeignKey("conversation.id"),
+        nullable=True,  # Null for core memories (collection "0")
+    )
+    embedding = Column(Vector)
+    text = Column(Text, nullable=False)
+    external_source = Column(String, default="user input")
+    description = Column(Text)
+    timestamp = Column(DateTime, server_default=func.now())
+    additional_metadata = Column(Text)
+
+    # Relationships
+    agent = relationship("Agent", backref="memories")
+    conversation = relationship("Conversation", backref="memories")
+
+
+@event.listens_for(Memory.__table__, "after_create")
+def setup_vector_column(target, connection, **kw):
+    if DATABASE_TYPE != "sqlite":
+        try:
+            # Create extension and convert column type
+            connection.execute(text("CREATE EXTENSION IF NOT EXISTS vector;"))
+
+            # Convert the float[] column to vector type
+            connection.execute(
+                text(
+                    """
+                ALTER TABLE memory 
+                ALTER COLUMN embedding TYPE vector(1536) 
+                USING embedding::vector(1536);
+            """
+                )
+            )
+
+            # Create the index
+            connection.execute(
+                text(
+                    """
+                CREATE INDEX IF NOT EXISTS memory_embedding_idx 
+                ON memory 
+                USING ivfflat (embedding vector_l2_ops) 
+                WITH (lists = 100);
+            """
+                )
+            )
+
+        except Exception as e:
+            logging.error(f"Error setting up vector column: {e}")
+
+    else:
+        try:
+            # Try to load the VSS extension
+            sqlite_vss_path = getenv("SQLITE_VSS_PATH", "./sqlite-vss/vss0")
+            connection.execute(text(f"SELECT load_extension('{sqlite_vss_path}')"))
+            connection.execute(
+                text(
+                    """
+                CREATE VIRTUAL TABLE IF NOT EXISTS vss_memories 
+                USING vss0(embedding(1536));
+            """
+                )
+            )
+        except Exception as e:
+            logging.error(f"Error setting up SQLite vector search: {e}")
+
+
 def setup_default_roles():
     with get_session() as db:
         default_roles = [
@@ -727,9 +839,6 @@ def setup_default_roles():
                 new_role = UserRole(**role)
                 db.add(new_role)
         db.commit()
-
-
-from sqlalchemy import text
 
 
 def migrate_company_agent_name():
@@ -781,37 +890,55 @@ def migrate_company_agent_name():
     except Exception as e:
         logging.error(f"Error during company agent_name migration: {e}")
         session.rollback()
-        raise
     finally:
         session.close()
 
 
+# Replace the if __name__ == "__main__": section with this:
+
 if __name__ == "__main__":
     import uvicorn
 
-    if DATABASE_TYPE.lower().startswith("postgres"):
-        logging.info("Connecting to database...")
+    if DATABASE_TYPE != "sqlite":
+        logging.info("Connecting to database and setting up vector extension...")
         while True:
             try:
-                connection = engine.connect()
-                connection.close()
+                # Create a new connection
+                with engine.connect() as connection:
+                    # First create the vector extension
+                    connection.execute(text("CREATE EXTENSION IF NOT EXISTS vector"))
+                    connection.commit()
+                    logging.info("Vector extension created successfully")
                 break
             except Exception as e:
-                logging.error(f"Error connecting to database: {e}")
+                logging.error(f"Error setting up database: {e}")
                 time.sleep(5)
-    # Create any missing tables
+
+    # Now create all tables
+    logging.info("Creating database tables...")
+    Base.metadata.create_all(engine)
+    logging.info("Database tables created successfully")
+
+    # Run migrations
     try:
         migrate_company_agent_name()
+        logging.info("Company agent name migration completed")
     except Exception as e:
         logging.error(f"Error during migration: {e}")
-    Base.metadata.create_all(engine)
+
+    # Setup roles
     setup_default_roles()
+    logging.info("Default roles setup completed")
+
+    # Handle seed data
     seed_data = str(getenv("SEED_DATA")).lower() == "true"
     if seed_data:
-        # Import seed data
         from SeedImports import import_all_data
 
         import_all_data()
+        logging.info("Seed data imported successfully")
+
+    # Start the server
     uvicorn.run(
         "app:app",
         host="0.0.0.0",
